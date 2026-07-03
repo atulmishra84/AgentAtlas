@@ -7,19 +7,49 @@ to the repository layer per Architect's design. Every route that touched
 AGENTS_DB / CONNECTORS_DB / etc. now calls the corresponding repository method
 with tenant_id as the structural first argument.
 """
-import asyncio, hashlib, json, logging, os, time, uuid
+import asyncio
+import hashlib
+import json
+import logging
+import os
+import time
+import uuid
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Literal
 
 import jwt
-from cryptography.fernet import Fernet
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from opentelemetry import trace
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
+from pydantic import BaseModel
+from starlette.middleware.base import BaseHTTPMiddleware
+
+from database import async_session, engine, init_db
+from repositories import (
+    AgentRepository,
+    AuditRepository,
+    ConnectorRepository,
+    EventRepository,
+    HistoryRepository,
+    JobRepository,
+    RelationshipRepository,
+    SiemRepository,
+    TenantRepository,
+    UserRepository,
+)
+from seed import seed_database
 
 # ── Structured logging ───────────────────────────────────────────────────
 # JSON lines, not human-formatted text — a log aggregator (Loki/CloudWatch)
@@ -45,22 +75,11 @@ _handler = logging.StreamHandler()
 _handler.setFormatter(JsonFormatter())
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"), handlers=[_handler], force=True)
 logger = logging.getLogger("agentAtlas")
-from fastapi.exceptions import RequestValidationError
-from starlette.middleware.base import BaseHTTPMiddleware
-from pydantic import BaseModel
 
 # ── Observability instrumentation ────────────────────────────────────────
 # OTel and Prometheus are wired here, in the app, not bolted on as a sidecar
 # afterthought — request-scoped trace context and route-aware metrics need
 # to come from inside the request lifecycle to be useful for debugging.
-from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
-from opentelemetry import trace
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
-from opentelemetry.sdk.resources import Resource
-from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-
 REQUEST_COUNT = Counter(
     "agentatlas_http_requests_total", "Total HTTP requests",
     ["method", "path", "status_code"]
@@ -90,14 +109,6 @@ if OTEL_ENDPOINT:
     provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=OTEL_ENDPOINT, insecure=True)))
     trace.set_tracer_provider(provider)
 tracer = trace.get_tracer("agentatlas")
-
-from database import init_db, async_session, engine
-from repositories import (
-    AgentRepository, ConnectorRepository, EventRepository, AuditRepository,
-    UserRepository, TenantRepository, SiemRepository, JobRepository,
-    HistoryRepository, RelationshipRepository
-)
-from seed import seed_database
 
 # ── Config ─────────────────────────────────────────────────────────────────
 SECRET_KEY = os.environ.get("JWT_SECRET", "agentAtlas-dev-secret-change-in-prod")
@@ -230,10 +241,13 @@ async def publish_event(session, event_type, payload, tenant_id=None):
     await repo.append(event)
     dead = []
     for ws in WS_CONNECTIONS:
-        try: await ws.send_text(json.dumps(event, default=str))
-        except Exception: dead.append(ws)
+        try:
+            await ws.send_text(json.dumps(event, default=str))
+        except Exception:
+            dead.append(ws)
     for ws in dead:
-        if ws in WS_CONNECTIONS: WS_CONNECTIONS.remove(ws)
+        if ws in WS_CONNECTIONS:
+            WS_CONNECTIONS.remove(ws)
     return event
 
 @asynccontextmanager
@@ -456,16 +470,19 @@ async def get_stats(current_user: Dict = Depends(verify_token), session=Depends(
 async def get_agent(agent_id: str, current_user: Dict = Depends(verify_token), session=Depends(get_session)):
     repo = AgentRepository(session)
     a = await repo.get(current_user["tenant_id"], agent_id)
-    if not a: raise HTTPException(404, "Not found")
+    if not a:
+        raise HTTPException(404, "Not found")
     return a
 
 @app.patch("/api/v1/agents/{agent_id}")
 async def update_agent(agent_id: str, update: AgentUpdate, current_user: Dict = Depends(verify_token), session=Depends(get_session)):
-    if current_user["role"] != "admin": raise HTTPException(403, "Admin required")
+    if current_user["role"] != "admin":
+        raise HTTPException(403, "Admin required")
     repo = AgentRepository(session)
     data = {k: v for k, v in update.model_dump().items() if v is not None and k != "tags"}
     result = await repo.update(current_user["tenant_id"], agent_id, data)
-    if not result: raise HTTPException(404, "Not found")
+    if not result:
+        raise HTTPException(404, "Not found")
     await audit(session, "AGENT_UPDATED", f"agent:{agent_id}", user=current_user, details=data)
     await publish_event(session, "agent.updated", {"agent_id": agent_id, "changes": data}, current_user["tenant_id"])
     return result
@@ -474,7 +491,8 @@ async def update_agent(agent_id: str, update: AgentUpdate, current_user: Dict = 
 async def agent_history(agent_id: str, limit: int = 50, current_user: Dict = Depends(verify_token), session=Depends(get_session)):
     agent_repo = AgentRepository(session)
     a = await agent_repo.get(current_user["tenant_id"], agent_id)
-    if not a: raise HTTPException(404, "Agent not found")
+    if not a:
+        raise HTTPException(404, "Agent not found")
     hist_repo = HistoryRepository(session)
     changes = await hist_repo.for_agent(agent_id, limit)
     return {"agent_id": agent_id, "total": len(changes), "changes": changes}
@@ -483,7 +501,8 @@ async def agent_history(agent_id: str, limit: int = 50, current_user: Dict = Dep
 async def agent_graph(agent_id: str, depth: int = 2, current_user: Dict = Depends(verify_token), session=Depends(get_session)):
     agent_repo = AgentRepository(session)
     a = await agent_repo.get(current_user["tenant_id"], agent_id)
-    if not a: raise HTTPException(404, "Agent not found")
+    if not a:
+        raise HTTPException(404, "Agent not found")
     rel_repo = RelationshipRepository(session)
     rels = await rel_repo.for_agent(current_user["tenant_id"], agent_id)
     nodes = {agent_id: {"id": agent_id, "name": a["name"], "type": a["agent_type"], "framework": a.get("framework")}}
@@ -513,10 +532,12 @@ async def list_connectors(current_user: Dict = Depends(verify_token), session=De
 
 @app.post("/api/v1/connectors")
 async def create_connector(body: ConnectorCreate, current_user: Dict = Depends(verify_token), session=Depends(get_session)):
-    if current_user["role"] != "admin": raise HTTPException(403, "Admin required")
+    if current_user["role"] != "admin":
+        raise HTTPException(403, "Admin required")
     repo = ConnectorRepository(session)
     existing = await repo.get(current_user["tenant_id"], body.connector_id)
-    if existing: raise HTTPException(409, f"Connector '{body.connector_id}' already exists")
+    if existing:
+        raise HTTPException(409, f"Connector '{body.connector_id}' already exists")
     data = {**body.model_dump(), "status": "unknown", "agents_found": 0, "last_run": None, "is_enabled": True}
     result = await repo.create(current_user["tenant_id"], data)
     await audit(session, "CONNECTOR_CREATED", f"connector:{body.connector_id}", user=current_user)
@@ -524,20 +545,24 @@ async def create_connector(body: ConnectorCreate, current_user: Dict = Depends(v
 
 @app.put("/api/v1/connectors/{connector_id}")
 async def update_connector(connector_id: str, body: ConnectorUpdate, current_user: Dict = Depends(verify_token), session=Depends(get_session)):
-    if current_user["role"] != "admin": raise HTTPException(403, "Admin required")
+    if current_user["role"] != "admin":
+        raise HTTPException(403, "Admin required")
     repo = ConnectorRepository(session)
     data = {k: v for k, v in body.model_dump().items() if v is not None}
     result = await repo.update(current_user["tenant_id"], connector_id, data)
-    if not result: raise HTTPException(404, "Not found")
+    if not result:
+        raise HTTPException(404, "Not found")
     await audit(session, "CONNECTOR_UPDATED", f"connector:{connector_id}", user=current_user, details=data)
     return result
 
 @app.delete("/api/v1/connectors/{connector_id}")
 async def delete_connector(connector_id: str, current_user: Dict = Depends(verify_token), session=Depends(get_session)):
-    if current_user["role"] != "admin": raise HTTPException(403, "Admin required")
+    if current_user["role"] != "admin":
+        raise HTTPException(403, "Admin required")
     repo = ConnectorRepository(session)
     ok = await repo.delete(current_user["tenant_id"], connector_id)
-    if not ok: raise HTTPException(404, "Not found")
+    if not ok:
+        raise HTTPException(404, "Not found")
     await audit(session, "CONNECTOR_DELETED", f"connector:{connector_id}", user=current_user)
     return {"deleted": True, "connector_id": connector_id}
 
@@ -545,7 +570,8 @@ async def delete_connector(connector_id: str, current_user: Dict = Depends(verif
 async def test_connector(connector_id: str, current_user: Dict = Depends(verify_token), session=Depends(get_session)):
     repo = ConnectorRepository(session)
     c = await repo.get(current_user["tenant_id"], connector_id)
-    if not c: raise HTTPException(404, "Not found")
+    if not c:
+        raise HTTPException(404, "Not found")
     return {"connector_id": connector_id, "status": c["status"], "ok": c["status"] == "healthy"}
 
 @app.get("/api/v1/discovery/coverage")
@@ -556,10 +582,12 @@ async def coverage(current_user: Dict = Depends(verify_token), session=Depends(g
 # ── Discovery jobs ───────────────────────────────────────────────────────────
 @app.post("/api/v1/discovery/trigger")
 async def trigger_discovery(body: TriggerDiscoveryRequest, current_user: Dict = Depends(verify_token), session=Depends(get_session)):
-    if current_user["role"] != "admin": raise HTTPException(403, "Admin required")
+    if current_user["role"] != "admin":
+        raise HTTPException(403, "Admin required")
     conn_repo = ConnectorRepository(session)
     connector = await conn_repo.get(current_user["tenant_id"], body.connector_id)
-    if not connector: raise HTTPException(404, "Connector not found")
+    if not connector:
+        raise HTTPException(404, "Connector not found")
     job_id = f"job_{uuid.uuid4().hex[:10]}"
     job_repo = JobRepository(session)
     await job_repo.create({
@@ -599,7 +627,8 @@ async def list_siem(current_user: Dict = Depends(verify_token), session=Depends(
 
 @app.post("/api/v1/siem/targets")
 async def create_siem(body: SIEMTargetCreate, current_user: Dict = Depends(verify_token), session=Depends(get_session)):
-    if current_user["role"] != "admin": raise HTTPException(403, "Admin required")
+    if current_user["role"] != "admin":
+        raise HTTPException(403, "Admin required")
     repo = SiemRepository(session)
     data = {**body.model_dump(), "target_id": f"tgt_{uuid.uuid4().hex[:10]}",
             "status": "active", "is_enabled": True, "delivered": 0, "failed": 0, "last_export": None}
@@ -621,12 +650,14 @@ async def field_mappings(siem_type: str, current_user: Dict = Depends(verify_tok
         "chronicle": {"metadata.eventTimestamp": "timestamp"},
     }
     mapping = DEFAULTS.get(siem_type.lower())
-    if not mapping: raise HTTPException(404, f"No mapping for '{siem_type}'")
+    if not mapping:
+        raise HTTPException(404, f"No mapping for '{siem_type}'")
     return {"siem_type": siem_type, "default_field_mapping": mapping}
 
 @app.post("/api/v1/siem/export/batch")
 async def batch_export(current_user: Dict = Depends(verify_token), session=Depends(get_session)):
-    if current_user["role"] != "admin": raise HTTPException(403, "Admin required")
+    if current_user["role"] != "admin":
+        raise HTTPException(403, "Admin required")
     siem_repo = SiemRepository(session)
     targets = [t for t in await siem_repo.list(current_user["tenant_id"]) if t["is_enabled"]]
     event_repo = EventRepository(session)
@@ -647,29 +678,34 @@ async def list_events(limit: int = 50, current_user: Dict = Depends(verify_token
 async def get_event(event_id: str, current_user: Dict = Depends(verify_token), session=Depends(get_session)):
     repo = EventRepository(session)
     e = await repo.get_by_id(event_id)
-    if not e: raise HTTPException(404, "Event not found")
+    if not e:
+        raise HTTPException(404, "Event not found")
     return e
 
 @app.get("/api/v1/audit")
 async def get_audit(current_user: Dict = Depends(verify_token), session=Depends(get_session)):
-    if current_user["role"] != "admin": raise HTTPException(403, "Admin required")
+    if current_user["role"] != "admin":
+        raise HTTPException(403, "Admin required")
     repo = AuditRepository(session)
     return {"logs": await repo.recent(current_user["tenant_id"])}
 
 # ── Tenants & Users ──────────────────────────────────────────────────────────
 @app.get("/api/v1/tenants")
 async def list_tenants(current_user: Dict = Depends(verify_token), session=Depends(get_session)):
-    if current_user["role"] != "admin": raise HTTPException(403, "Admin required")
+    if current_user["role"] != "admin":
+        raise HTTPException(403, "Admin required")
     repo = TenantRepository(session)
     t = await repo.get(current_user["tenant_id"])
     return {"tenants": [t] if t else []}
 
 @app.post("/api/v1/tenants")
 async def create_tenant(body: TenantCreate, current_user: Dict = Depends(verify_token), session=Depends(get_session)):
-    if current_user["role"] != "admin": raise HTTPException(403, "Admin required")
+    if current_user["role"] != "admin":
+        raise HTTPException(403, "Admin required")
     repo = TenantRepository(session)
     existing = await repo.get(body.tenant_id)
-    if existing: raise HTTPException(409, "Tenant already exists")
+    if existing:
+        raise HTTPException(409, "Tenant already exists")
     data = {**body.model_dump(), "created_at": datetime.now(timezone.utc)}
     result = await repo.create(data)
     await audit(session, "TENANT_CREATED", f"tenant:{body.tenant_id}", user=current_user)
@@ -677,18 +713,22 @@ async def create_tenant(body: TenantCreate, current_user: Dict = Depends(verify_
 
 @app.get("/api/v1/users")
 async def list_users(current_user: Dict = Depends(verify_token), session=Depends(get_session)):
-    if current_user["role"] != "admin": raise HTTPException(403, "Admin required")
+    if current_user["role"] != "admin":
+        raise HTTPException(403, "Admin required")
     repo = UserRepository(session)
     users_list = await repo.list(current_user["tenant_id"])
     return {"users": [{"user_id": u["user_id"], "username": u["username"], "role": u["role"]} for u in users_list]}
 
 @app.post("/api/v1/users")
 async def create_user(body: UserCreate, current_user: Dict = Depends(verify_token), session=Depends(get_session)):
-    if current_user["role"] != "admin": raise HTTPException(403, "Admin required")
-    if len(body.password) < 8: raise HTTPException(422, "Password must be at least 8 characters")
+    if current_user["role"] != "admin":
+        raise HTTPException(403, "Admin required")
+    if len(body.password) < 8:
+        raise HTTPException(422, "Password must be at least 8 characters")
     repo = UserRepository(session)
     existing = await repo.get_by_username(body.username)
-    if existing: raise HTTPException(409, "Username already exists")
+    if existing:
+        raise HTTPException(409, "Username already exists")
     user = {
         "user_id": f"usr_{uuid.uuid4().hex[:8]}", "username": body.username,
         "password_hash": hashlib.sha256(body.password.encode()).hexdigest(),
@@ -700,11 +740,14 @@ async def create_user(body: UserCreate, current_user: Dict = Depends(verify_toke
 
 @app.delete("/api/v1/users/{username}")
 async def delete_user(username: str, current_user: Dict = Depends(verify_token), session=Depends(get_session)):
-    if current_user["role"] != "admin": raise HTTPException(403, "Admin required")
-    if username == current_user["username"]: raise HTTPException(400, "Cannot delete own account")
+    if current_user["role"] != "admin":
+        raise HTTPException(403, "Admin required")
+    if username == current_user["username"]:
+        raise HTTPException(400, "Cannot delete own account")
     repo = UserRepository(session)
     ok = await repo.delete(current_user["tenant_id"], username)
-    if not ok: raise HTTPException(404, "User not found")
+    if not ok:
+        raise HTTPException(404, "User not found")
     await audit(session, "USER_DELETED", f"user:{username}", user=current_user)
     return {"deleted": True, "username": username}
 
@@ -713,15 +756,19 @@ async def delete_user(username: str, current_user: Dict = Depends(verify_token),
 async def ws_events(websocket: WebSocket):
     token = websocket.query_params.get("token")
     if not token:
-        await websocket.close(code=4001, reason="Token required"); return
+        await websocket.close(code=4001, reason="Token required")
+        return
     try:
         jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
     except jwt.InvalidTokenError:
-        await websocket.close(code=4001, reason="Invalid token"); return
+        await websocket.close(code=4001, reason="Invalid token")
+        return
     await websocket.accept()
     WS_CONNECTIONS.append(websocket)
     try:
         await websocket.send_text(json.dumps({"type": "connected", "msg": "AgentAtlas stream ready"}))
-        while True: await websocket.receive_text()
+        while True:
+            await websocket.receive_text()
     except WebSocketDisconnect:
-        if websocket in WS_CONNECTIONS: WS_CONNECTIONS.remove(websocket)
+        if websocket in WS_CONNECTIONS:
+            WS_CONNECTIONS.remove(websocket)

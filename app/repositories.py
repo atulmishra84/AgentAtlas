@@ -10,7 +10,7 @@ without a tenant_id; the call won't satisfy the method signature.
 """
 from __future__ import annotations
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Optional
 
 from sqlalchemy import select, insert, update, delete, func, and_, Integer
 from sqlalchemy.ext.asyncio import AsyncSession
