@@ -1,0 +1,170 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  AgentAtlas — CodeDeploy lifecycle hook Lambda functions.
+  Deploys the smoke-test Lambda that CodeDeploy calls during AfterAllowTestTraffic
+  to verify the green task set before shifting production traffic.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: agentatlas
+
+  Environment:
+    Type: String
+    Default: mvp
+
+  ALBDnsName:
+    Type: String
+    Description: ALB DNS name (from Terraform output alb_dns_name)
+
+  TestListenerPort:
+    Type: Number
+    Default: 8080
+    Description: Port of the ALB test listener CodeDeploy creates for blue/green
+
+Resources:
+
+  # ── IAM role for the hook Lambda ──────────────────────────────────────────
+  HookLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${Environment}-hook-lambda-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CodeDeployLifecycleHook
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # The Lambda MUST call PutLifecycleEventHookExecutionStatus
+              # or CodeDeploy will time out the hook and treat it as a failure.
+              - Effect: Allow
+                Action:
+                  - codedeploy:PutLifecycleEventHookExecutionStatus
+                Resource: "*"
+
+  # ── CloudWatch log group ──────────────────────────────────────────────────
+  HookLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-${Environment}-smoke-test-hook"
+      RetentionInDays: 14
+
+  # ── Smoke test hook Lambda ────────────────────────────────────────────────
+  SmokeTestHookLambda:
+    Type: AWS::Lambda::Function
+    DependsOn: HookLambdaLogGroup
+    Properties:
+      FunctionName: !Sub "${ProjectName}-${Environment}-smoke-test-hook"
+      Description: >
+        CodeDeploy AfterAllowTestTraffic hook. Runs smoke tests against the
+        green ECS task set before production traffic shifts. Reports Pass/Fail
+        back to CodeDeploy to trigger automatic rollback on failure.
+      Runtime: python3.12
+      Handler: smoke_test_lambda.lambda_handler
+      Role: !GetAtt HookLambdaRole.Arn
+      Timeout: 120
+      MemorySize: 128
+      Environment:
+        Variables:
+          ALB_DNS_NAME: !Ref ALBDnsName
+          TEST_LISTENER_PORT: !Ref TestListenerPort
+          CODEDEPLOY_REGION: !Ref AWS::Region
+      Code:
+        # Inline for simplicity — for production, replace with
+        # S3Bucket/S3Key pointing to a packaged deployment artifact.
+        # aws lambda update-function-code --function-name ... --zip-file fileb://hook.zip
+        ZipFile: |
+          import json, os, time, urllib.error, urllib.request, boto3
+
+          codedeploy = boto3.client("codedeploy", region_name=os.environ.get("CODEDEPLOY_REGION","us-east-1"))
+          ALB_DNS   = os.environ.get("ALB_DNS_NAME","")
+          TEST_PORT = int(os.environ.get("TEST_LISTENER_PORT","8080"))
+          BASE_URL  = f"http://{ALB_DNS}:{TEST_PORT}"
+
+          def req(path, method="GET", body=None, token=None):
+              data = json.dumps(body).encode() if body else None
+              headers = {"Content-Type":"application/json"}
+              if token: headers["Authorization"] = f"Bearer {token}"
+              r = urllib.request.Request(BASE_URL+path, data=data, headers=headers, method=method)
+              with urllib.request.urlopen(r, timeout=10) as resp:
+                  return resp.status, json.loads(resp.read())
+
+          def lambda_handler(event, context):
+              results = []
+              def chk(name, ok):
+                  results.append((name,ok))
+                  print(f"  {'PASS' if ok else 'FAIL'}: {name}")
+
+              deadline = time.time()+60
+              live = False
+              while time.time()<deadline:
+                  try:
+                      code,_ = req("/healthz")
+                      if code==200: live=True; break
+                  except: pass
+                  time.sleep(3)
+              chk("Liveness", live)
+
+              try:
+                  code,_ = req("/readyz")
+                  chk("Readiness", code==200)
+              except Exception as e: chk(f"Readiness — {e}", False)
+
+              try:
+                  code,body = req("/api/v1/auth/login",method="POST",body={"username":"admin","password":"Admin@123"})
+                  token = body.get("access_token","")
+                  chk("Login", code==200 and bool(token))
+              except Exception as e: token=""; chk(f"Login — {e}", False)
+
+              if token:
+                  try:
+                      code,body = req("/api/v1/agents/stats",token=token)
+                      chk("Stats endpoint", code==200 and "total" in body)
+                  except Exception as e: chk(f"Stats — {e}", False)
+
+              try:
+                  code,_ = req("/api/v1/agents/stats")
+                  chk("Unauthed rejected", code in(401,403))
+              except urllib.error.HTTPError as e: chk("Unauthed rejected", e.code in(401,403))
+              except Exception as e: chk(f"Unauthed — {e}", False)
+
+              passed = sum(1 for _,ok in results if ok)
+              total = len(results)
+              print(f"Smoke test: {passed}/{total}")
+              status = "Succeeded" if passed==total else "Failed"
+
+              codedeploy.put_lifecycle_event_hook_execution_status(
+                  deploymentId=event["DeploymentId"],
+                  lifecycleEventHookExecutionId=event["LifecycleEventHookExecutionId"],
+                  status=status
+              )
+              return {"status":status}
+
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Grant CodeDeploy permission to invoke this Lambda
+  SmokeTestHookPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SmokeTestHookLambda
+      Action: lambda:InvokeFunction
+      Principal: codedeploy.amazonaws.com
+
+Outputs:
+  SmokeTestLambdaArn:
+    Description: Use this ARN in the appspec.yml AfterAllowTestTraffic hook
+    Value: !GetAtt SmokeTestHookLambda.Arn
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-smoke-test-lambda-arn"

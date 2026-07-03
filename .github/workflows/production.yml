@@ -1,0 +1,284 @@
+name: AgentAtlas — Production CI/CD
+
+# Pipeline philosophy at production maturity (vs. the MVP pipeline this
+# supersedes): every deploy to production MUST have first passed through
+# staging and a real smoke test there. No path exists where a merge to
+# main goes straight to production — that's the entire point of this
+# pipeline's existence over the simpler MVP one.
+
+on:
+  push:
+    branches: [main]
+    paths: ["app/**", "k8s/**", "helm/**", ".github/workflows/production.yml"]
+  pull_request:
+    branches: [main]
+    paths: ["app/**"]
+  workflow_dispatch:
+    inputs:
+      rollback_to_sha:
+        description: "Git SHA to roll back production to (skips build, redeploys existing image)"
+        required: false
+        type: string
+
+env:
+  REGISTRY: REGISTRY_HOST  # e.g. 123456789.dkr.ecr.us-east-1.amazonaws.com or ghcr.io/org
+  IMAGE_NAME: agentatlas/api
+  EKS_CLUSTER: agentatlas-prod
+
+permissions:
+  id-token: write   # OIDC federation — no static cloud credentials in CI, anywhere
+  contents: read
+  pull-requests: write  # for posting test/coverage results as PR comments
+
+jobs:
+  # ════════════════════════════════════════════════════════════════════════
+  # STAGE 1 — Build, unit test, security gate. Runs on every push and PR.
+  # ════════════════════════════════════════════════════════════════════════
+  build-and-test:
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.vars.outputs.image_tag }}
+      image_digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set image tag (git SHA, immutable — never "latest" in a real pipeline)
+        id: vars
+        run: echo "image_tag=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        working-directory: app
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Lint (ruff)
+        working-directory: app
+        run: ruff check . --output-format=github
+
+      - name: Type check (mypy)
+        working-directory: app
+        run: mypy main.py database.py repositories.py --ignore-missing-imports
+        continue-on-error: true  # advisory for now — promote to blocking once the baseline is clean
+
+      - name: Unit + integration tests
+        working-directory: app
+        run: |
+          pytest tests/ -v --cov=. --cov-report=xml --cov-report=term \
+            --junitxml=test-results.xml
+        env:
+          DATABASE_URL: "sqlite+aiosqlite:///./test.db"
+
+      - name: Publish test results
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name: Test results
+          path: app/test-results.xml
+          reporter: java-junit
+
+      - name: Boot the app and run the security regression gate
+        working-directory: app
+        run: |
+          rm -f agentatlas.db
+          python3 -m uvicorn main:app --port 8001 &
+          SERVER_PID=$!
+          sleep 5
+          # Same battery validated through the four-agent engineering pass:
+          # JWT none-algorithm, unauthenticated access, RBAC, injection,
+          # security headers, WebSocket auth. A failing security gate BLOCKS
+          # the build — there is no "merge anyway" path from here.
+          python3 ../ci/security_gate.py --port 8001 --min-score 95
+          GATE_EXIT=$?
+          kill $SERVER_PID
+          exit $GATE_EXIT
+
+      - name: Build container image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: app
+          push: false
+          load: true
+          tags: ${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.image_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Scan image for vulnerabilities (Trivy)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.image_tag }}"
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          ignore-unfixed: true
+
+      - name: Upload Trivy results to GitHub Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+
+      - name: Scan Dockerfile itself (hadolint)
+        uses: hadolint/hadolint-action@v3
+        with:
+          dockerfile: app/Dockerfile
+
+      - name: Validate Kubernetes manifests against real API schema
+        run: |
+          curl -sL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz | tar xz kubeconform
+          curl -sL "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash -s 5.4.3
+          ./kustomize build k8s/overlays/staging | ./kubeconform -summary -ignore-missing-schemas -skip ExternalSecret,ClusterSecretStore -strict
+          ./kustomize build k8s/overlays/production | ./kubeconform -summary -ignore-missing-schemas -skip ExternalSecret,ClusterSecretStore -strict
+
+  # ════════════════════════════════════════════════════════════════════════
+  # STAGE 2 — Push image (only on main, not on PRs — PRs never push images)
+  # ════════════════════════════════════════════════════════════════════════
+  push-image:
+    needs: build-and-test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/agentatlas-ci-push
+          aws-region: us-east-1
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: ecr
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: app
+          push: true
+          tags: |
+            ${{ steps.ecr.outputs.registry }}/${{ env.IMAGE_NAME }}:${{ needs.build-and-test.outputs.image_tag }}
+          cache-from: type=gha
+
+      - name: Sign the image (cosign — supply chain integrity)
+        run: |
+          curl -sL https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64 -o cosign
+          chmod +x cosign
+          ./cosign sign --yes \
+            "${{ steps.ecr.outputs.registry }}/${{ env.IMAGE_NAME }}:${{ needs.build-and-test.outputs.image_tag }}"
+
+  # ════════════════════════════════════════════════════════════════════════
+  # STAGE 3 — Deploy to STAGING automatically, every merge to main
+  # ════════════════════════════════════════════════════════════════════════
+  deploy-staging:
+    needs: [build-and-test, push-image]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+      url: https://staging-api.agentatlas.io/api/docs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/agentatlas-ci-deploy-staging
+          aws-region: us-east-1
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name agentatlas-staging --region us-east-1
+
+      - name: Deploy via Kustomize
+        run: |
+          curl -sL "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash -s 5.4.3
+          cd k8s/overlays/staging
+          ../../../kustomize edit set image REGISTRY/agentatlas/api=${{ steps.ecr.outputs.registry }}/${{ env.IMAGE_NAME }}:${{ needs.build-and-test.outputs.image_tag }}
+          ../../../kustomize build . | kubectl apply -f -
+
+      - name: Wait for rollout
+        run: kubectl rollout status deployment/agentatlas-api -n agentatlas-staging --timeout=180s
+
+      - name: Run smoke tests against staging
+        run: python3 ci/smoke_test.py --base-url https://staging-api.agentatlas.io
+
+      - name: Run full functional + security regression against staging
+        run: python3 ci/security_gate.py --base-url https://staging-api.agentatlas.io --min-score 95
+
+  # ════════════════════════════════════════════════════════════════════════
+  # STAGE 4 — Deploy to PRODUCTION — requires manual approval via GitHub
+  # Environment protection rules (configured in repo settings: required
+  # reviewers on the "production" environment). This is the actual gate —
+  # not a suggestion in a README, an enforced GitHub feature that blocks
+  # the job from running until someone with permission clicks approve.
+  # ════════════════════════════════════════════════════════════════════════
+  deploy-production:
+    needs: deploy-staging
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://api.agentatlas.io/api/docs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/agentatlas-ci-deploy-prod
+          aws-region: us-east-1
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER }} --region us-east-1
+
+      - name: Deploy via Kustomize (rolling update, maxUnavailable=0)
+        run: |
+          curl -sL "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash -s 5.4.3
+          cd k8s/overlays/production
+          ../../../kustomize edit set image REGISTRY/agentatlas/api=${{ steps.ecr.outputs.registry }}/${{ env.IMAGE_NAME }}:${{ needs.build-and-test.outputs.image_tag }}
+          ../../../kustomize build . | kubectl apply -f -
+
+      - name: Wait for rollout (this is where maxUnavailable=0 + readiness probes actually earn their keep)
+        run: kubectl rollout status deployment/agentatlas-api -n agentatlas-production --timeout=300s
+
+      - name: Post-deploy smoke test
+        run: python3 ci/smoke_test.py --base-url https://api.agentatlas.io
+
+      - name: Tag this deploy in monitoring (annotation on Grafana dashboards)
+        run: |
+          curl -X POST "${{ secrets.GRAFANA_URL }}/api/annotations" \
+            -H "Authorization: Bearer ${{ secrets.GRAFANA_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"text\":\"Deploy ${{ needs.build-and-test.outputs.image_tag }}\",\"tags\":[\"deploy\",\"production\"]}"
+
+      - name: Automatic rollback on smoke test failure
+        if: failure()
+        run: |
+          echo "::error::Production smoke test failed — rolling back automatically"
+          kubectl rollout undo deployment/agentatlas-api -n agentatlas-production
+          kubectl rollout status deployment/agentatlas-api -n agentatlas-production --timeout=180s
+
+  # ════════════════════════════════════════════════════════════════════════
+  # Manual rollback path — triggered via workflow_dispatch, independent of
+  # the normal build pipeline. Redeploys an already-built, already-scanned
+  # image; does not rebuild from source (the whole point of rollback is
+  # speed and certainty, not re-running the build).
+  # ════════════════════════════════════════════════════════════════════════
+  rollback:
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.rollback_to_sha != ''
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.rollback_to_sha }}
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/agentatlas-ci-deploy-prod
+          aws-region: us-east-1
+      - run: aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER }} --region us-east-1
+      - name: Deploy the specified historical image tag
+        run: |
+          curl -sL "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash -s 5.4.3
+          cd k8s/overlays/production
+          ROLLBACK_TAG="${GITHUB_EVENT_INPUTS_ROLLBACK_TO_SHA:0:12}"
+          ../../../kustomize edit set image REGISTRY/agentatlas/api=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${ROLLBACK_TAG}
+          ../../../kustomize build . | kubectl apply -f -
+          kubectl rollout status deployment/agentatlas-api -n agentatlas-production --timeout=180s
+        env:
+          GITHUB_EVENT_INPUTS_ROLLBACK_TO_SHA: ${{ github.event.inputs.rollback_to_sha }}
+      - run: python3 ci/smoke_test.py --base-url https://api.agentatlas.io

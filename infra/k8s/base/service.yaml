@@ -1,0 +1,119 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: agentatlas-api
+  namespace: agentatlas
+  labels:
+    app: agentatlas-api
+spec:
+  type: ClusterIP
+  selector:
+    app: agentatlas-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: agentatlas-api-hpa
+  namespace: agentatlas
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: agentatlas-api
+  minReplicas: 2
+  maxReplicas: 12
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+  behavior:
+    # Scale up fast (don't make users wait through a traffic spike), scale
+    # down slow (don't thrash pods up and down on noisy/bursty traffic —
+    # each scale-down is a connection-draining event, not free).
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120
+---
+# PodDisruptionBudget — the actual mechanism that prevents a voluntary
+# disruption (node drain for a K8s upgrade, cluster-autoscaler scale-down,
+# `kubectl drain`) from taking down enough pods at once to cause an outage.
+# Without this, a node upgrade can legally evict both replicas simultaneously.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: agentatlas-api-pdb
+  namespace: agentatlas
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: agentatlas-api
+---
+# Default-deny NetworkPolicy plus explicit allow rules. Without this, every
+# pod in the cluster can reach every other pod — a NetworkPolicy is what
+# actually enforces "the database is only reachable from the API," not just
+# "the database's security group says so" (defense in depth: this matters
+# even when the cloud-level network ACL already restricts it).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: agentatlas-api-netpol
+  namespace: agentatlas
+spec:
+  podSelector:
+    matchLabels:
+      app: agentatlas-api
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 8000
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 8000
+  egress:
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: TCP
+          port: 5432  # Postgres
+        - protocol: TCP
+          port: 6379  # Redis
+    - to: []
+      ports:
+        - protocol: TCP
+          port: 443  # HTTPS egress for any external connector calls
+        - protocol: UDP
+          port: 53   # DNS
+        - protocol: TCP
+          port: 53

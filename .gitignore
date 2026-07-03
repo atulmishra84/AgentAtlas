@@ -1,0 +1,87 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+.env
+
+# Local databases — never commit real data to Git
+*.db
+*.sqlite
+*.sqlite3
+
+# Test artifacts
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+test-results.xml
+/tmp/
+
+# Environment files — use .env.example as the template
+.env
+.env.local
+.env.production
+.env.staging
+
+# Terraform state — managed remotely in S3, never in Git
+*.tfstate
+*.tfstate.backup
+.terraform/
+.terraform.lock.hcl
+tfplan
+
+# AWS credentials — absolutely never in Git
+.aws/
+aws-credentials
+*.pem
+*.key
+
+# Secrets
+secrets/
+*_secret.*
+*_credentials.*
+JWT_SECRET
+FERNET_KEY
+
+# Node
+node_modules/
+npm-debug.log
+yarn-error.log
+.pnpm-debug.log
+dist/
+.vite/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+*.zip
+*.tar.gz
+*.whl
+__pycache__
+
+# Docker
+.dockerignore
+
+# Security reports (contain finding details — don't push to public repos)
+reports/
+pentest_results.json
+security_*.json
+
+# CI/CD generated files
+taskdef.json
+image_metadata.json
+container-test.log

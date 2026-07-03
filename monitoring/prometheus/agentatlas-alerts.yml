@@ -1,0 +1,141 @@
+# AgentAtlas — Alerting Rules
+# Every rule below references a metric this session actually instrumented
+# and verified emits real data (agentatlas_http_requests_total,
+# agentatlas_http_request_duration_seconds) or a standard Kubernetes metric
+# any cluster exposes (kube_pod_status, container resource usage). No rule
+# here references a metric that doesn't exist yet.
+
+groups:
+  - name: agentatlas-availability
+    rules:
+      - alert: AgentAtlasHighErrorRate
+        expr: |
+          sum(rate(agentatlas_http_requests_total{status_code=~"5.."}[5m]))
+          /
+          sum(rate(agentatlas_http_requests_total[5m]))
+          > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "AgentAtlas API error rate above 5%"
+          description: "{{ $value | humanizePercentage }} of requests are returning 5xx over the last 5 minutes. Check recent deploys first — this is the exact signature the automatic-rollback step in the production pipeline watches for."
+          runbook: "https://wiki.internal/agentatlas/runbooks/high-error-rate"
+
+      - alert: AgentAtlasPodCrashLooping
+        expr: |
+          increase(kube_pod_container_status_restarts_total{namespace="agentatlas-production"}[15m]) > 3
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Pod {{ $labels.pod }} is crash-looping"
+          description: "More than 3 restarts in 15 minutes. Check `kubectl logs {{ $labels.pod }} --previous` for the exit reason before assuming it's transient."
+
+      - alert: AgentAtlasNoHealthyPods
+        expr: |
+          kube_deployment_status_replicas_available{namespace="agentatlas-production", deployment="agentatlas-api"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          page: "true"
+        annotations:
+          summary: "AgentAtlas has zero healthy pods — full outage"
+          description: "The PodDisruptionBudget (minAvailable: 1) should make this nearly impossible during a normal rollout. If this fires, something bypassed the PDB or all pods failed simultaneously — page immediately."
+
+      - alert: AgentAtlasPDBViolationRisk
+        expr: |
+          kube_deployment_status_replicas_available{namespace="agentatlas-production", deployment="agentatlas-api"} < 2
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "AgentAtlas running below minimum healthy replica count"
+          description: "Fewer than 2 pods available — one more pod loss away from a PDB-protected minimum. Investigate before it becomes critical."
+
+  - name: agentatlas-performance
+    rules:
+      - alert: AgentAtlasHighLatency
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(agentatlas_http_request_duration_seconds_bucket[5m])) by (le, path)
+          ) > 1.0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p95 latency above 1s on {{ $labels.path }}"
+          description: "95th percentile response time has exceeded 1 second for 10 minutes. Check the trace exporter (Tempo/X-Ray) for this path to find the slow span — likely a DB query missing an index, given the route."
+
+      - alert: AgentAtlasHPAMaxedOut
+        expr: |
+          kube_horizontalpodautoscaler_status_current_replicas{namespace="agentatlas-production"}
+          >= kube_horizontalpodautoscaler_spec_max_replicas{namespace="agentatlas-production"}
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "HPA at max replicas (12) for 10+ minutes"
+          description: "Autoscaling has hit its ceiling and traffic is still high. Either this is a genuine capacity need (raise maxReplicas) or a runaway client (check access logs by source IP)."
+
+      - alert: AgentAtlasHighMemoryUsage
+        expr: |
+          container_memory_working_set_bytes{namespace="agentatlas-production", container="api"}
+          / container_spec_memory_limit_bytes{namespace="agentatlas-production", container="api"}
+          > 0.85
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Pod {{ $labels.pod }} memory usage above 85% of its 768Mi limit"
+          description: "Approaching the OOM-kill threshold. If this is a single pod and not cluster-wide, suspect a per-request memory leak rather than genuine load."
+
+  - name: agentatlas-business-signals
+    # These alert on product-meaningful events, not just infrastructure —
+    # the kind of thing a platform team and a product owner both care about.
+    rules:
+      - alert: AgentAtlasShadowAISpike
+        expr: |
+          increase(agentatlas_shadow_agents_detected_total[1h]) > 5
+        labels:
+          severity: warning
+          notify: security-team
+        annotations:
+          summary: "Unusual spike in shadow AI detections"
+          description: "{{ $value }} new shadow AI agents detected in the last hour for tenant {{ $labels.tenant_id }} — well above the steady-state baseline. Could indicate a new unsanctioned tool rollout, or a connector misclassifying legitimate agents as shadow. Worth a human look either way."
+
+      - alert: AgentAtlasDiscoveryJobFailureRate
+        expr: |
+          sum(rate(agentatlas_discovery_jobs_total{status="failed"}[1h])) by (connector_id)
+          /
+          sum(rate(agentatlas_discovery_jobs_total[1h])) by (connector_id)
+          > 0.2
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Connector {{ $labels.connector_id }} failing >20% of discovery jobs"
+          description: "Sustained failure rate suggests an expired credential or an upstream API change, not transient network noise."
+
+  - name: agentatlas-security
+    rules:
+      - alert: AgentAtlasAuthFailureSpike
+        expr: |
+          sum(rate(agentatlas_http_requests_total{path="/api/v1/auth/login", status_code="401"}[5m])) > 5
+        for: 5m
+        labels:
+          severity: warning
+          notify: security-team
+        annotations:
+          summary: "Elevated login failure rate — possible credential stuffing"
+          description: "More than 5 failed logins/sec sustained for 5 minutes. The app's own rate limiter (10/min/IP) should already be throttling a single source — if this metric is still climbing, check whether requests are distributed across many IPs (botnet pattern) rather than one."
+
+      - alert: AgentAtlasRateLimitTripping
+        expr: |
+          sum(rate(agentatlas_http_requests_total{status_code="429"}[5m])) > 1
+        for: 5m
+        labels:
+          severity: info
+        annotations:
+          summary: "Rate limiter actively throttling requests"
+          description: "Informational — confirms the rate limiter is doing its job. Escalate only if this correlates with a legitimate customer complaint about being blocked."

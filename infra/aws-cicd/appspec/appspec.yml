@@ -1,0 +1,38 @@
+version: 0.0
+Resources:
+  - TargetService:
+      Type: AWS::ECS::Service
+      Properties:
+        TaskDefinition: <TASK_DEFINITION>
+        LoadBalancerInfo:
+          ContainerName: "backend"
+          ContainerPort: 8000
+        PlatformVersion: LATEST
+        # NetworkConfiguration is inherited from the existing service —
+        # CodeDeploy uses the service's current VPC, subnets, and security
+        # groups. No change needed here unless the network config changes.
+
+Hooks:
+  # BeforeInstall runs before the green task set launches.
+  # Used here to emit a structured event so the deployment appears as a
+  # named annotation on Grafana dashboards (the hook calls a Lambda or
+  # SSM run command; kept as a placeholder here for the first deploy).
+  - BeforeInstall: "LambdaFunctionToCallBeforeInstall"
+
+  # AfterInstall: green task set is running but traffic hasn't shifted yet.
+  # This is where you'd run db migrations — the new code is up, old code
+  # is still serving traffic, so backward-compatible migrations are safe here.
+  - AfterInstall: "LambdaFunctionToCallAfterInstall"
+
+  # AfterAllowTestTraffic: runs after the test listener (port 8080) is
+  # serving traffic to the green set but before the production listener shifts.
+  # This is the hook for running smoke_test.py against the green set before
+  # any real traffic hits it.
+  - AfterAllowTestTraffic: "LambdaFunctionToCallAfterAllowTestTraffic"
+
+  # BeforeAllowTraffic: last chance to abort before production traffic moves.
+  - BeforeAllowTraffic: "LambdaFunctionToCallBeforeAllowTraffic"
+
+  # AfterAllowTraffic: production traffic is now fully on green.
+  # Used here to emit the deploy event to the monitoring stack.
+  - AfterAllowTraffic: "LambdaFunctionToCallAfterAllowTraffic"

@@ -1,0 +1,16 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: agentatlas-production
+resources:
+  - ../../base
+patches:
+  - target:
+      kind: Deployment
+      name: agentatlas-api
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 3
+images:
+  - name: REGISTRY/agentatlas/api
+    newTag: PLACEHOLDER  # rewritten by CI to the exact git SHA being deployed

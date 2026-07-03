@@ -1,0 +1,122 @@
+version: 0.2
+
+# ── Build stage: pytest → Docker build → ECR push → produce artifacts ────────
+# Runs on CodeBuild standard:7.0 (Python 3.12, Docker 24, AWS CLI v2 pre-installed)
+# PrivilegedMode: true is required for Docker daemon inside CodeBuild
+
+env:
+  variables:
+    PYTHON_VERSION: "3.12"
+    MIN_SECURITY_SCORE: "95"
+  exported-variables:
+    - IMAGE_TAG
+    - ECR_REPO_URI
+
+phases:
+  install:
+    runtime-versions:
+      python: "3.12"
+    commands:
+      - echo "=== Install phase ==="
+      - pip install --upgrade pip --quiet
+      - pip install -r production/app/requirements.txt
+            -r production/app/requirements-dev.txt --quiet
+      - echo "Dependencies installed"
+
+  pre_build:
+    commands:
+      - echo "=== Pre-build: authenticate to ECR ==="
+      - IMAGE_TAG="${CODEBUILD_RESOLVED_SOURCE_VERSION:0:12}"
+      - echo "Image tag will be ${IMAGE_TAG}"
+      - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" |
+          docker login --username AWS --password-stdin "$ECR_REPO_URI"
+      - echo "ECR login successful"
+
+  build:
+    commands:
+      - echo "=== Build phase ==="
+
+      # ── 1. Pytest ────────────────────────────────────────────────────────
+      - echo "Running pytest..."
+      - cd production/app
+      - export DATABASE_URL="sqlite+aiosqlite:///./test.db"
+      - python -m pytest tests/ -v
+          --junitxml=/tmp/test-results.xml
+          --cov=. --cov-report=xml:/tmp/coverage.xml
+          --tb=short -q
+      - echo "Tests passed"
+      - cd ../..
+
+      # ── 2. Security headers / syntax lint ────────────────────────────────
+      - echo "Linting main.py..."
+      - python -m py_compile production/app/main.py
+      - python -m py_compile production/app/database.py
+      - python -m py_compile production/app/repositories.py
+      - echo "Syntax OK"
+
+      # ── 3. Docker build ──────────────────────────────────────────────────
+      - echo "Building Docker image..."
+      - docker build
+          --build-arg BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          --build-arg VCS_REF="${CODEBUILD_RESOLVED_SOURCE_VERSION}"
+          --build-arg VERSION="${IMAGE_TAG}"
+          --cache-from "${ECR_REPO_URI}:latest"
+          -t "${ECR_REPO_URI}:${IMAGE_TAG}"
+          -f production/app/Dockerfile
+          production/app/
+      - docker tag "${ECR_REPO_URI}:${IMAGE_TAG}" "${ECR_REPO_URI}:latest"
+      - echo "Docker build complete"
+
+      # ── 4. ECR push ──────────────────────────────────────────────────────
+      - echo "Pushing to ECR..."
+      - docker push "${ECR_REPO_URI}:${IMAGE_TAG}"
+      - docker push "${ECR_REPO_URI}:latest"
+      - echo "Push complete: ${ECR_REPO_URI}:${IMAGE_TAG}"
+
+      # ── 5. Produce taskdef.json for CodeDeploy ────────────────────────────
+      # CodeDeploy needs a task definition JSON with the exact image URI it
+      # should deploy. We fetch the current registered task definition from ECS,
+      # update the container image, strip the read-only ECS-managed fields, and
+      # write the result to taskdef.json in the artifact root.
+      - echo "Generating taskdef.json for CodeDeploy..."
+      - CURRENT_TASK_DEF=$(aws ecs describe-task-definition
+          --task-definition "${PROJECT_NAME}-backend"
+          --query "taskDefinition"
+          --output json)
+      - echo "$CURRENT_TASK_DEF" | python3 scripts/generate_taskdef.py
+      - echo "taskdef.json written"
+      - cat taskdef.json | python3 -m json.tool > /dev/null && echo "Valid JSON"
+
+  post_build:
+    commands:
+      - echo "=== Post-build ==="
+      - echo "Image ${ECR_REPO_URI}:${IMAGE_TAG} pushed and ready"
+
+      # Write image metadata for the security gate stage to consume
+      - printf '{"imageUri":"%s:%s","imageTag":"%s"}' \
+          "$ECR_REPO_URI" "$IMAGE_TAG" "$IMAGE_TAG" > image_metadata.json
+      - cat image_metadata.json
+
+reports:
+  pytest-results:
+    files:
+      - "/tmp/test-results.xml"
+    file-format: JUNITXML
+  pytest-coverage:
+    files:
+      - "/tmp/coverage.xml"
+    file-format: COBERTURAXML
+
+artifacts:
+  files:
+    - taskdef.json
+    - image_metadata.json
+    - appspec/appspec.yml
+    - production/cicd/security_gate.py
+    - production/cicd/smoke_test.py
+  discard-paths: no
+
+cache:
+  paths:
+    - "/root/.cache/pip/**/*"
+    - "/root/.docker/**/*"

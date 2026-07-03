@@ -1,0 +1,169 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agentatlas-api
+  namespace: agentatlas
+  labels:
+    app: agentatlas-api
+    component: api
+spec:
+  # Minimum 2, not 1 — a single replica means every deploy and every node
+  # drain is a guaranteed brief outage. Two replicas across two AZs (via
+  # the topology spread constraint below) means a deploy, a node failure,
+  # or an AZ blip never drops capacity to zero.
+  replicas: 2
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # maxUnavailable: 0 means Kubernetes must bring up a new pod and wait
+      # for it to pass readiness BEFORE killing an old one — capacity never
+      # dips during a deploy, at the cost of briefly running N+1 pods.
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: agentatlas-api
+  template:
+    metadata:
+      labels:
+        app: agentatlas-api
+        component: api
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: "/metrics"
+        prometheus.io/port: "8000"
+    spec:
+      serviceAccountName: agentatlas-api
+      # securityContext at the pod level — enforced in addition to (not instead
+      # of) the Dockerfile's USER directive, because a compromised image with a
+      # malicious ENTRYPOINT can't override this; it's enforced by the kubelet.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+
+      # Spread pods across both AZs and prefer different nodes — this is what
+      # actually makes "2 replicas" mean "survives an AZ outage" rather than
+      # "2 pods that happen to both land on the same node in the same AZ."
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: agentatlas-api
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app: agentatlas-api
+
+      # Graceful shutdown budget: must exceed the app's own shutdown handler
+      # time (WS close + DB pool dispose) plus time for the load balancer to
+      # stop routing new traffic to this pod after it's marked NotReady.
+      terminationGracePeriodSeconds: 30
+
+      containers:
+        - name: api
+          image: REGISTRY/agentatlas/api:IMAGE_TAG  # rewritten by CI per deploy
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+          resources:
+            requests:
+              cpu: 250m
+              memory: 384Mi
+            limits:
+              # No CPU limit — CPU limits cause throttling under burst load
+              # even when the node has spare capacity (a well-documented
+              # Kubernetes CFS quota issue). Memory limit IS set, because an
+              # unbounded memory leak should OOM-kill this one pod, not the node.
+              memory: 768Mi
+
+          env:
+            - name: ENVIRONMENT
+              value: "production"
+            - name: LOG_LEVEL
+              value: "INFO"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://otel-collector.monitoring.svc.cluster.local:4317"
+          envFrom:
+            - secretRef:
+                name: agentatlas-app-secrets
+            - configMapRef:
+                name: agentatlas-config
+
+          # Liveness: only restart the pod if the process itself is wedged.
+          # Generous failureThreshold — a slow-but-alive process shouldn't
+          # get killed just because it missed a beat under load.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 4
+
+          # Readiness: pull from rotation fast if a dependency (DB) is down,
+          # put back fast once it recovers. Tighter thresholds than liveness.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 2
+            successThreshold: 1
+
+          # Startup probe: gives slow-starting pods (DB migration check,
+          # connection pool warmup) up to 60s before liveness probing even
+          # begins, so a legitimately-slow boot never gets killed mid-startup.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 12
+
+          # Read-only root filesystem (set above) means anything the app
+          # writes to disk needs an explicit writable mount. SQLite dev mode
+          # writes a .db file — in production this is Postgres-only so /tmp
+          # is the only writable path actually needed (uvicorn's reload
+          # cache, any tempfile usage).
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+
+          lifecycle:
+            preStop:
+              # Sleep before SIGTERM propagates — gives the Service/Endpoints
+              # controller time to remove this pod from rotation BEFORE the
+              # app starts refusing new connections. Without this, there's a
+              # race where the LB can still route a request to a pod that's
+              # already shutting down.
+              exec:
+                command: ["sh", "-c", "sleep 5"]
+
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 100Mi

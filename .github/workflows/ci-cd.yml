@@ -1,0 +1,174 @@
+name: AgentAtlas CI/CD
+
+# Runs on every push to main and every PR.
+# PRs: build + test + security gate only (never deploy).
+# main: build + test + security gate → deploy staging → manual approval → deploy production.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      rollback_to_sha:
+        description: "Git SHA to roll back production to"
+        required: false
+        type: string
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: agentatlas/backend
+  ECS_CLUSTER: agentatlas-mvp
+  ECS_SERVICE: agentatlas-backend
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+jobs:
+  # ── Stage 1: Build and test ───────────────────────────────────────────────
+  build-test:
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.vars.outputs.image_tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set image tag
+        id: vars
+        run: echo "image_tag=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        working-directory: app
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Run pytest (17 tests)
+        working-directory: app
+        run: |
+          DATABASE_URL="sqlite+aiosqlite:///./test.db" \
+          python -m pytest tests/ -v --junitxml=/tmp/test-results.xml \
+            --cov=. --cov-report=xml:/tmp/coverage.xml -q
+        env:
+          DATABASE_URL: "sqlite+aiosqlite:///./test.db"
+
+      - name: Run security gate against live server
+        working-directory: app
+        run: |
+          DATABASE_URL="sqlite+aiosqlite:///./gate.db" \
+          python -m uvicorn main:app --port 8001 &
+          SERVER_PID=$!
+          sleep 5
+          python security_gate.py --port 8001 --min-score 95
+          GATE_EXIT=$?
+          kill $SERVER_PID
+          exit $GATE_EXIT
+
+      - name: Build Docker image
+        run: docker build -t agentatlas:${{ steps.vars.outputs.image_tag }} -f app/Dockerfile app/
+
+      - name: Scan for vulnerabilities (Trivy)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "agentatlas:${{ steps.vars.outputs.image_tag }}"
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          ignore-unfixed: true
+
+      - name: Validate Kubernetes manifests
+        run: |
+          curl -sL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz | tar xz kubeconform
+          curl -sL "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash -s 5.4.3
+          ./kustomize build infra/k8s/overlays/staging    | ./kubeconform -summary -ignore-missing-schemas -skip ExternalSecret,ClusterSecretStore -strict
+          ./kustomize build infra/k8s/overlays/production | ./kubeconform -summary -ignore-missing-schemas -skip ExternalSecret,ClusterSecretStore -strict
+
+  # ── Stage 2: Push image to ECR (main branch only) ────────────────────────
+  push-image:
+    needs: build-test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/agentatlas-github-deploy
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: ecr
+
+      - name: Build and push to ECR
+        run: |
+          IMAGE="${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ needs.build-test.outputs.image_tag }}"
+          docker build -t $IMAGE -f app/Dockerfile app/
+          docker push $IMAGE
+          docker tag $IMAGE "${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest"
+          docker push "${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest"
+
+  # ── Stage 3: Deploy staging ───────────────────────────────────────────────
+  deploy-staging:
+    needs: [build-test, push-image]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+      url: https://staging-api.agentatlas.io/api/docs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/agentatlas-github-deploy
+          aws-region: ${{ env.AWS_REGION }}
+      - run: aws eks update-kubeconfig --name agentatlas-staging --region ${{ env.AWS_REGION }}
+
+      - name: Deploy to staging
+        run: |
+          curl -sL "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash -s 5.4.3
+          cd infra/k8s/overlays/staging
+          ../../../kustomize edit set image agentatlas/api=${{ needs.push-image.outputs.ecr_uri }}:${{ needs.build-test.outputs.image_tag }}
+          ../../../kustomize build . | kubectl apply -f -
+          kubectl rollout status deployment/agentatlas-api -n agentatlas-staging --timeout=180s
+
+      - name: Smoke test staging
+        run: python app/smoke_test.py --base-url https://staging-api.agentatlas.io
+
+  # ── Stage 4: Deploy production (manual approval required) ─────────────────
+  deploy-production:
+    needs: deploy-staging
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://api.agentatlas.io/api/docs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/agentatlas-github-deploy
+          aws-region: ${{ env.AWS_REGION }}
+      - run: aws eks update-kubeconfig --name agentatlas-prod --region ${{ env.AWS_REGION }}
+
+      - name: Deploy to production (rolling, maxUnavailable=0)
+        run: |
+          curl -sL "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash -s 5.4.3
+          cd infra/k8s/overlays/production
+          ../../../kustomize edit set image agentatlas/api=${{ needs.push-image.outputs.ecr_uri }}:${{ needs.build-test.outputs.image_tag }}
+          ../../../kustomize build . | kubectl apply -f -
+          kubectl rollout status deployment/agentatlas-api -n agentatlas-production --timeout=300s
+
+      - name: Smoke test production
+        run: python app/smoke_test.py --base-url https://api.agentatlas.io
+
+      - name: Automatic rollback on failure
+        if: failure()
+        run: kubectl rollout undo deployment/agentatlas-api -n agentatlas-production

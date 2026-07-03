@@ -1,0 +1,224 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  AgentAtlas — CI/CD observability stack.
+  CloudWatch alarms for pipeline health, deployment success rate,
+  and the ECS service state after each deployment.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: agentatlas
+
+  Environment:
+    Type: String
+    Default: mvp
+
+  ECSClusterName:
+    Type: String
+
+  ECSServiceName:
+    Type: String
+
+  NotificationTopicArn:
+    Type: String
+    Description: SNS topic ARN for alerts (from pipeline stack output NotificationTopicArn)
+
+Resources:
+
+  # ── Deployment failure alarm ──────────────────────────────────────────────
+  # Fires when any CodeDeploy deployment to the ECS service fails.
+  # CodeDeploy emits FailedDeployments as a CloudWatch metric.
+  DeploymentFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${Environment}-deployment-failure"
+      AlarmDescription: >
+        A CodeDeploy blue/green deployment failed. The service rolled back
+        automatically — check the CodeDeploy console and the smoke test
+        Lambda logs to determine whether the test failure was a real regression
+        or a transient infrastructure issue.
+      Namespace: AWS/CodeDeploy
+      MetricName: FailedDeployments
+      Dimensions:
+        - Name: DeploymentGroupName
+          Value: !Sub "${ProjectName}-${Environment}-dg"
+        - Name: DeploymentType
+          Value: Blue/Green
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref NotificationTopicArn
+      OKActions:
+        - !Ref NotificationTopicArn
+
+  # ── ECS service health after deployment ───────────────────────────────────
+  # Detects if a deployment left the service with fewer healthy tasks than expected.
+  ECSUnhealthyTaskAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${Environment}-ecs-unhealthy-post-deploy"
+      AlarmDescription: >
+        ECS service has fewer running tasks than desired after a deployment.
+        Either the new task definition is crash-looping or the ALB health check
+        is failing on the new image.
+      Namespace: AWS/ECS
+      MetricName: RunningTaskCount
+      Dimensions:
+        - Name: ClusterName
+          Value: !Ref ECSClusterName
+        - Name: ServiceName
+          Value: !Ref ECSServiceName
+      Statistic: Minimum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions:
+        - !Ref NotificationTopicArn
+
+  # ── CodeBuild failure alarm ────────────────────────────────────────────────
+  # Fires when the build or security gate CodeBuild project fails.
+  CodeBuildFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${Environment}-codebuild-failure"
+      AlarmDescription: >
+        A CodeBuild project failed. Check whether it was the test stage
+        (pytest failure) or the security gate (regression below 95/100).
+        Both block deployment — this alarm fires in either case.
+      Namespace: AWS/CodeBuild
+      MetricName: FailedBuilds
+      Dimensions:
+        - Name: ProjectName
+          Value: !Sub "${ProjectName}-${Environment}-build"
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref NotificationTopicArn
+
+  # ── EventBridge rule: deployment succeeded notification ───────────────────
+  DeploymentSuccessRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment}-deployment-success"
+      Description: Notify when a CodeDeploy deployment succeeds
+      EventPattern:
+        source:
+          - aws.codedeploy
+        detail-type:
+          - CodeDeploy Deployment State-change Notification
+        detail:
+          state:
+            - SUCCESS
+          deploymentGroupName:
+            - !Sub "${ProjectName}-${Environment}-dg"
+      Targets:
+        - Arn: !Ref NotificationTopicArn
+          Id: NotifyOnSuccess
+          InputTransformer:
+            InputPathsMap:
+              deployment: "$.detail.deploymentId"
+              group: "$.detail.deploymentGroupName"
+            InputTemplate: |
+              "AgentAtlas deploy SUCCESS: deployment <deployment> to <group> completed.
+               Traffic has shifted to the new task set."
+
+  DeploymentSuccessRulePermission:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref NotificationTopicArn
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref NotificationTopicArn
+
+  # ── Dashboard: pipeline and deployment metrics ────────────────────────────
+  CICDDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "${ProjectName}-${Environment}-cicd"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "properties": {
+                "title": "CodeBuild — builds per hour",
+                "metrics": [
+                  ["AWS/CodeBuild","SucceededBuilds","ProjectName","${ProjectName}-${Environment}-build"],
+                  ["AWS/CodeBuild","FailedBuilds","ProjectName","${ProjectName}-${Environment}-build"]
+                ],
+                "period": 3600,
+                "stat": "Sum",
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric",
+              "properties": {
+                "title": "Security gate — build duration (seconds)",
+                "metrics": [
+                  ["AWS/CodeBuild","Duration","ProjectName","${ProjectName}-${Environment}-security-gate"]
+                ],
+                "period": 3600,
+                "stat": "Average",
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric",
+              "properties": {
+                "title": "CodeDeploy — successful deployments",
+                "metrics": [
+                  ["AWS/CodeDeploy","SucceededDeployments","DeploymentGroupName","${ProjectName}-${Environment}-dg","DeploymentType","Blue/Green"],
+                  ["AWS/CodeDeploy","FailedDeployments","DeploymentGroupName","${ProjectName}-${Environment}-dg","DeploymentType","Blue/Green"]
+                ],
+                "period": 86400,
+                "stat": "Sum",
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric",
+              "properties": {
+                "title": "ECS — running task count",
+                "metrics": [
+                  ["AWS/ECS","RunningTaskCount","ClusterName","${ECSClusterName}","ServiceName","${ECSServiceName}"]
+                ],
+                "period": 60,
+                "stat": "Minimum",
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "alarm",
+              "properties": {
+                "title": "CI/CD alarm status",
+                "alarms": [
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${ProjectName}-${Environment}-deployment-failure",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${ProjectName}-${Environment}-codebuild-failure",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${ProjectName}-${Environment}-ecs-unhealthy-post-deploy"
+                ]
+              }
+            }
+          ]
+        }
+
+Outputs:
+  CICDDashboardUrl:
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home#dashboards:name=${ProjectName}-${Environment}-cicd"
+    Description: CloudWatch dashboard for CI/CD health

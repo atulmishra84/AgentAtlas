@@ -1,0 +1,20 @@
+# Pinned to exact versions — "latest" in a production requirements file
+# is how a Tuesday afternoon becomes an incident. Renovate/Dependabot
+# opens PRs for updates; humans review and merge them through CI, not
+# through an unpinned build silently picking up a new minor version.
+
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+pyjwt==2.9.0
+cryptography==43.0.1
+python-multipart==0.0.12
+sqlalchemy[asyncio]==2.0.35
+asyncpg==0.29.0
+alembic==1.13.3
+
+# Observability
+opentelemetry-api==1.27.0
+opentelemetry-sdk==1.27.0
+opentelemetry-instrumentation-fastapi==0.48b0
+opentelemetry-exporter-otlp==1.27.0
+prometheus-client==0.21.0

@@ -1,0 +1,146 @@
+{
+  "title": "AgentAtlas — Production Overview",
+  "tags": ["agentatlas", "production"],
+  "timezone": "utc",
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "panels": [
+    {
+      "title": "Request rate by status code",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum(rate(agentatlas_http_requests_total[1m])) by (status_code)",
+          "legendFormat": "{{status_code}}"
+        }
+      ]
+    },
+    {
+      "title": "p50 / p95 / p99 latency",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(agentatlas_http_request_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(agentatlas_http_request_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(agentatlas_http_request_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p99"
+        }
+      ]
+    },
+    {
+      "title": "Error rate (%)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 8 },
+      "targets": [
+        {
+          "expr": "100 * sum(rate(agentatlas_http_requests_total{status_code=~\"5..\"}[5m])) / sum(rate(agentatlas_http_requests_total[5m]))"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "red", "value": 5 }
+            ]
+          },
+          "unit": "percent"
+        }
+      }
+    },
+    {
+      "title": "Healthy pods / desired",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 8 },
+      "targets": [
+        {
+          "expr": "kube_deployment_status_replicas_available{namespace=\"agentatlas-production\", deployment=\"agentatlas-api\"}"
+        }
+      ]
+    },
+    {
+      "title": "Shadow AI agents detected (24h)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 8 },
+      "targets": [
+        {
+          "expr": "increase(agentatlas_shadow_agents_detected_total[24h])"
+        }
+      ]
+    },
+    {
+      "title": "Active rate-limit throttling",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 8 },
+      "targets": [
+        {
+          "expr": "sum(rate(agentatlas_http_requests_total{status_code=\"429\"}[5m]))"
+        }
+      ]
+    },
+    {
+      "title": "Discovery job outcomes by connector",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "targets": [
+        {
+          "expr": "sum(rate(agentatlas_discovery_jobs_total[5m])) by (connector_id, status)",
+          "legendFormat": "{{connector_id}} — {{status}}"
+        }
+      ]
+    },
+    {
+      "title": "Database query latency by repository",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(agentatlas_db_query_duration_seconds_bucket[5m])) by (le, repository))",
+          "legendFormat": "{{repository}} p95"
+        }
+      ]
+    },
+    {
+      "title": "Pod CPU usage vs request/limit",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
+      "targets": [
+        {
+          "expr": "sum(rate(container_cpu_usage_seconds_total{namespace=\"agentatlas-production\", container=\"api\"}[5m])) by (pod)",
+          "legendFormat": "{{pod}}"
+        }
+      ]
+    },
+    {
+      "title": "Pod memory usage vs limit",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
+      "targets": [
+        {
+          "expr": "container_memory_working_set_bytes{namespace=\"agentatlas-production\", container=\"api\"}",
+          "legendFormat": "{{pod}}"
+        }
+      ]
+    }
+  ],
+  "annotations": {
+    "list": [
+      {
+        "name": "Deploys",
+        "datasource": "grafana",
+        "enable": true,
+        "iconColor": "blue",
+        "tags": ["deploy"]
+      }
+    ]
+  }
+}

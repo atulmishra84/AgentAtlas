@@ -1,0 +1,100 @@
+# AgentAtlas Helm chart — default values.
+# Override per environment with -f values-staging.yaml / -f values-production.yaml,
+# never by editing this file per-deploy — that defeats the point of having a chart.
+
+replicaCount: 2
+
+image:
+  repository: REGISTRY/agentatlas/api
+  tag: ""  # set via --set image.tag=$GIT_SHA in CI, never left as "latest" in a real deploy
+  pullPolicy: IfNotPresent
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 384Mi
+  limits:
+    memory: 768Mi
+    # Deliberately no CPU limit — see deployment.yaml comment in the
+    # kustomize base for the CFS-throttling rationale; same logic applies here.
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 12
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+
+podDisruptionBudget:
+  minAvailable: 1
+
+topologySpread:
+  enabled: true
+  maxSkew: 1
+  topologyKey: topology.kubernetes.io/zone
+
+probes:
+  liveness:
+    path: /healthz
+    initialDelaySeconds: 10
+    periodSeconds: 15
+    failureThreshold: 4
+  readiness:
+    path: /readyz
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    failureThreshold: 2
+  startup:
+    path: /healthz
+    periodSeconds: 5
+    failureThreshold: 12
+
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+service:
+  type: ClusterIP
+  port: 80
+
+ingress:
+  enabled: true
+  className: nginx
+  host: api.agentatlas.io
+  tls: true
+  clusterIssuer: letsencrypt-prod
+  annotations:
+    nginx.ingress.kubernetes.io/limit-rps: "50"
+
+env:
+  ENVIRONMENT: production
+  LOG_LEVEL: INFO
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector.monitoring.svc.cluster.local:4317"
+
+externalSecrets:
+  enabled: true
+  secretStoreRef: aws-secrets-manager
+  refreshInterval: 1h
+  remoteRefs:
+    JWT_SECRET: agentatlas/production/app-secrets#JWT_SECRET
+    DATABASE_URL: agentatlas/production/db-credentials#connection_string
+    FERNET_KEY: agentatlas/production/app-secrets#FERNET_KEY
+
+serviceAccount:
+  create: true
+  annotations:
+    eks.amazonaws.com/role-arn: "arn:aws:iam::ACCOUNT_ID:role/agentatlas-api-pod-role"
+
+monitoring:
+  serviceMonitor:
+    enabled: true
+    interval: 15s
+    path: /metrics
