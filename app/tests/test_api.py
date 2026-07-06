@@ -137,7 +137,8 @@ class TestHealthEndpoints:
 
 class TestSecurity:
     async def test_jwt_none_algorithm_rejected(self, client):
-        import base64, json as json_lib
+        import base64
+        import json as json_lib
         h64 = base64.urlsafe_b64encode(b'{"alg":"none","typ":"JWT"}').rstrip(b"=").decode()
         p64 = base64.urlsafe_b64encode(json_lib.dumps({
             "sub": "x", "username": "admin", "role": "admin", "tenant_id": "ten_demo",

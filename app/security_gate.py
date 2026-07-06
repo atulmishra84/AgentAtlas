@@ -5,8 +5,13 @@ not just localhost), and raises the bar to 95/100 minimum for a production
 pipeline vs. the 85/100 threshold used at MVP stage — there's no excuse for
 a known regression class reaching production once it's been caught once.
 """
-import argparse, base64, json, socket, sys, time, urllib.error, urllib.request
-from urllib.parse import urlparse
+import argparse
+import base64
+import json
+import socket
+import sys
+import urllib.error
+import urllib.request
 
 
 def req(base, method, path, body=None, token=None):
@@ -132,7 +137,7 @@ def main():
             metrics_body = r.read().decode()
         chk("Prometheus /metrics endpoint exposed",
             metrics_code == 200 and "agentatlas_http_requests_total" in metrics_body, "low")
-    except Exception as e:
+    except Exception:
         chk("Prometheus /metrics endpoint exposed", False, "low")
 
     passed = sum(1 for _, ok, _ in results if ok)

@@ -18,3 +18,10 @@ opentelemetry-sdk==1.27.0
 opentelemetry-instrumentation-fastapi==0.48b0
 opentelemetry-exporter-otlp==1.27.0
 prometheus-client==0.21.0
+
+# setuptools ships pkg_resources, which opentelemetry-instrumentation 0.48b0 imports
+# at module load time. Python 3.12+ no longer bundles setuptools, so we pin it
+# explicitly to avoid a ModuleNotFoundError on startup and during test collection.
+# Upper bound <82 because setuptools 82.0.0 removed pkg_resources from its wheel;
+# opentelemetry-instrumentation 0.48b0 imports it unconditionally at load time.
+setuptools>=75.0.0,<82.0.0

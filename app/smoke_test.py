@@ -6,7 +6,12 @@ separate, slower, more thorough pass). This answers one question: "did the
 thing that just got deployed actually come up and serve traffic correctly?"
 A failure here triggers automatic rollback in the production pipeline.
 """
-import argparse, json, sys, time, urllib.error, urllib.request
+import argparse
+import json
+import sys
+import time
+import urllib.error
+import urllib.request
 
 
 def req(base, method, path, body=None, token=None, timeout=10):
