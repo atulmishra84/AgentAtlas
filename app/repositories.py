@@ -10,7 +10,7 @@ without a tenant_id; the call won't satisfy the method signature.
 """
 from __future__ import annotations
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, List
 
 from sqlalchemy import select, insert, update, delete, func, and_, Integer
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -206,7 +206,7 @@ class ConnectorRepository:
         row = (await self.session.execute(stmt)).fetchone()
         return _row_to_dict(row) if row else None
 
-    async def create(self, tenant_id: str, data: dict) -> dict:
+    async def create(self, tenant_id: str, data: dict) -> Optional[dict]:
         data = {**data, "tenant_id": tenant_id}
         await self.session.execute(insert(connectors).values(**data))
         await self.session.commit()
@@ -359,7 +359,7 @@ class SiemRepository:
             "targets": records,
         }
 
-    async def record_export(self, tenant_id: str, target_ids: list[str], event_count: int):
+    async def record_export(self, tenant_id: str, target_ids: List[str], event_count: int):
         for tid in target_ids:
             stmt = (
                 update(siem_targets)

@@ -8,6 +8,7 @@ postgresql+asyncpg://... for production (the AWS Terraform already provisions
 the RDS instance this points to — see rds.tf db_secret_arn output).
 """
 import os
+from collections.abc import AsyncGenerator
 from datetime import datetime, timezone
 
 from sqlalchemy import (
@@ -216,6 +217,6 @@ async def init_db():
         await conn.run_sync(metadata.create_all)
 
 
-async def get_session() -> AsyncSession:
+async def get_session() -> AsyncGenerator[AsyncSession, None]:
     async with async_session() as session:
         yield session
